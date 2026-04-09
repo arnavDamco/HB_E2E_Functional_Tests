@@ -1,0 +1,16 @@
+# SQLite temporary files
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+
+# Agent Browser artifacts
+auth-state.json
+*.webm
+screenshots/
+
+# Sensitive test data
+test_data/credentials.json
