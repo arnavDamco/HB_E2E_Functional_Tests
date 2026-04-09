@@ -144,31 +144,66 @@ def api_tests(params):
         term = f"%{params['search'][0]}%"
         sql_params.extend([term, term])
 
+    # Pagination
+    limit = int(params.get("limit", [100])[0])
+    offset = int(params.get("offset", [0])[0])
+
     where = " AND ".join(conditions)
+
+    # Get total count for pagination
+    count_result = query_db(
+        f"SELECT COUNT(*) as total FROM tests t WHERE {where}", sql_params, one=True
+    )
+    total_count = count_result["total"] if count_result else 0
+
     tests = query_db(
         f"""SELECT t.id, t.name, t.description, t.test_type, t.scope,
             t.steps, t.expected_result, t.target_url, t.is_active,
             t.created_at, t.updated_at
             FROM tests t WHERE {where}
-            ORDER BY t.id""",
-        sql_params
+            ORDER BY t.id LIMIT ? OFFSET ?""",
+        sql_params + [limit, offset]
     )
 
-    # Attach modules and last 5 results per test
+    if not tests:
+        return tests
+
+    # Batch-load modules for all tests in one query
+    test_ids = [t["id"] for t in tests]
+    placeholders = ",".join("?" * len(test_ids))
+    all_modules = query_db(
+        f"""SELECT tm.test_id, m.id, m.key, m.name FROM modules m
+            JOIN test_modules tm ON m.id = tm.module_id
+            WHERE tm.test_id IN ({placeholders})""",
+        test_ids
+    )
+    modules_by_test = {}
+    for m in all_modules:
+        modules_by_test.setdefault(m["test_id"], []).append(
+            {"id": m["id"], "key": m["key"], "name": m["name"]}
+        )
+
+    # Batch-load last results using a window function
+    all_results = query_db(
+        f"""SELECT * FROM (
+            SELECT tr.test_id, tr.id, tr.run_id, tr.status, tr.completed_at,
+                   ROW_NUMBER() OVER (PARTITION BY tr.test_id ORDER BY tr.completed_at DESC) as rn
+            FROM test_runs tr WHERE tr.test_id IN ({placeholders})
+        ) WHERE rn <= 5""",
+        test_ids
+    )
+    results_by_test = {}
+    for r in all_results:
+        results_by_test.setdefault(r["test_id"], []).append(
+            {"id": r["id"], "run_id": r["run_id"], "status": r["status"],
+             "completed_at": r["completed_at"]}
+        )
+
     for test in tests:
-        test["modules"] = query_db(
-            """SELECT m.id, m.key, m.name FROM modules m
-               JOIN test_modules tm ON m.id = tm.module_id
-               WHERE tm.test_id = ?""",
-            (test["id"],)
-        )
-        test["last_results"] = query_db(
-            """SELECT tr.id, tr.run_id, tr.status, tr.completed_at
-               FROM test_runs tr WHERE tr.test_id = ?
-               ORDER BY tr.completed_at DESC LIMIT 5""",
-            (test["id"],)
-        )
-    return tests
+        test["modules"] = modules_by_test.get(test["id"], [])
+        test["last_results"] = results_by_test.get(test["id"], [])
+
+    return {"tests": tests, "total": total_count, "limit": limit, "offset": offset}
 
 
 def api_test_detail(test_id):
@@ -785,18 +820,18 @@ tr.inactive td { opacity: 0.45; }
     </div>
     <div class="filters" id="test-filters">
       <input type="text" id="test-search" placeholder="Search tests..." oninput="debounceLoadTests()">
-      <select id="test-type-filter" onchange="loadTests()">
+      <select id="test-type-filter" onchange="resetTestsPage()">
         <option value="">All Types</option>
         <option value="smoke">Smoke</option>
         <option value="critical">Critical</option>
         <option value="regression">Regression</option>
       </select>
-      <select id="test-scope-filter" onchange="loadTests()">
+      <select id="test-scope-filter" onchange="resetTestsPage()">
         <option value="">All Scopes</option>
         <option value="module">Module</option>
         <option value="inter_module">Inter-Module</option>
       </select>
-      <label><input type="checkbox" id="test-show-inactive" onchange="loadTests()"> Show inactive</label>
+      <label><input type="checkbox" id="test-show-inactive" onchange="resetTestsPage()"> Show inactive</label>
     </div>
     <div class="card card-shadow">
       <div class="table-wrap" id="tests-table"></div>
@@ -939,6 +974,8 @@ tr.inactive td { opacity: 0.45; }
 let currentView = 'dashboard';
 let allModules = [];
 let searchTimeout = null;
+let testsPage = 0;
+const testsPerPage = 50;
 
 // ── Navigation ─────────────────────────────────────────────
 function navigate(view, id) {
@@ -1114,8 +1151,11 @@ async function loadDashboard() {
 // ── Tests ──────────────────────────────────────────────────
 function debounceLoadTests() {
   clearTimeout(searchTimeout);
+  testsPage = 0;
   searchTimeout = setTimeout(loadTests, 300);
 }
+
+function resetTestsPage() { testsPage = 0; loadTests(); }
 
 async function loadTests() {
   const params = new URLSearchParams();
@@ -1128,8 +1168,12 @@ async function loadTests() {
   if (type) params.set('type', type);
   if (scope) params.set('scope', scope);
   if (!showInactive) params.set('active', '1');
+  params.set('limit', testsPerPage);
+  params.set('offset', testsPage * testsPerPage);
 
-  const tests = await api('/api/tests?' + params);
+  const data = await api('/api/tests?' + params);
+  const tests = data.tests;
+  const total = data.total;
   const container = document.getElementById('tests-table');
 
   if (tests.length === 0) {
@@ -1137,6 +1181,8 @@ async function loadTests() {
       showInactive ? 'No tests match your filters.' : 'No active tests found. Create one or adjust filters.');
     return;
   }
+
+  const totalPages = Math.ceil(total / testsPerPage);
 
   let html = '<table><thead><tr><th>#</th><th>Name</th><th>Type</th><th>Scope</th><th>Modules</th><th>History</th><th style="width:80px">Actions</th></tr></thead><tbody>';
   tests.forEach(t => {
@@ -1170,6 +1216,31 @@ async function loadTests() {
       '</td></tr>';
   });
   html += '</tbody></table>';
+
+  // Pagination
+  if (totalPages > 1) {
+    html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;font-size:13px;">' +
+      '<span style="color:var(--text-secondary)">Showing ' + (testsPage * testsPerPage + 1) + '–' +
+      Math.min((testsPage + 1) * testsPerPage, total) + ' of ' + total + ' tests</span>' +
+      '<div style="display:flex;gap:6px;">';
+    if (testsPage > 0) {
+      html += '<button class="btn btn-sm btn-ghost" onclick="testsPage=0;loadTests()">First</button>' +
+        '<button class="btn btn-sm btn-ghost" onclick="testsPage--;loadTests()">Prev</button>';
+    }
+    // Show page numbers around current page
+    const startPage = Math.max(0, testsPage - 2);
+    const endPage = Math.min(totalPages - 1, testsPage + 2);
+    for (let i = startPage; i <= endPage; i++) {
+      html += '<button class="btn btn-sm ' + (i === testsPage ? 'btn-primary' : 'btn-ghost') +
+        '" onclick="testsPage=' + i + ';loadTests()">' + (i + 1) + '</button>';
+    }
+    if (testsPage < totalPages - 1) {
+      html += '<button class="btn btn-sm btn-ghost" onclick="testsPage++;loadTests()">Next</button>' +
+        '<button class="btn btn-sm btn-ghost" onclick="testsPage=' + (totalPages - 1) + ';loadTests()">Last</button>';
+    }
+    html += '</div></div>';
+  }
+
   container.innerHTML = html;
 }
 
